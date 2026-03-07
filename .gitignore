@@ -7,3 +7,8 @@ __pycache__/
 .env
 exports/
 temp_extracted/
+.DS_Store
+.idea/
+*.egg-info/
+build/
+dist/
