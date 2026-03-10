@@ -15,7 +15,7 @@ from app.core.water_detector import WaterDetector
 from app.utils.exporter import ImageExporter
 from app.db import database
 
-from app.gui.workers import AnalysisWorker
+from app.gui.workers import AnalysisWorker, LoadWorker
 from app.gui.panels.left_panel import LeftPanel
 from app.gui.panels.center_panel import CenterPanel
 from app.gui.panels.stats_panel import StatsPanel
@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
         # Connections
         self.left_panel.files_loaded.connect(self._on_files_loaded)
         self.left_panel.analysis_requested.connect(self._start_analysis)
+        self.left_panel.load_progress.connect(self.status.showMessage)
         self.center_panel.export_requested.connect(self._export_results)
         self.stats_panel.object_selected.connect(self._on_object_selected)
 

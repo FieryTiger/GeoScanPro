@@ -12,7 +12,7 @@ class DataProcessor:
         self.data_cache = {}
         self.metadata = {}
 
-    def load_landsat_data(self, file_paths):
+    def load_landsat_data(self, file_paths, progress_callback=None):
         """Загрузка данных Landsat 9 из списка файлов .tif"""
         try:
             band_files = {}
@@ -49,6 +49,8 @@ class DataProcessor:
                 with rasterio.open(file_path) as src:
                     data = src.read(1).astype(np.float32)
                     loaded_data[band] = data
+                    if progress_callback:
+                        progress_callback(band, file_path)
                     if not self.metadata:
                         self.metadata = {
                             'crs': src.crs,
@@ -60,6 +62,8 @@ class DataProcessor:
 
             with rasterio.open(qa_file) as src:
                 loaded_data[self.required_qa] = src.read(1)
+            if progress_callback:
+                progress_callback(self.required_qa, qa_file)
 
             if thermal_file:
                 try:
@@ -73,6 +77,8 @@ class DataProcessor:
                     st[fill_mask] = np.nan
                     loaded_data['st_celsius'] = st
                     print("ST_B10 загружен — температурная маска доступна")
+                    if progress_callback:
+                        progress_callback('st_celsius', thermal_file)
                 except Exception as e:
                     print(f"Не удалось загрузить ST_B10: {e}")
 
@@ -85,6 +91,8 @@ class DataProcessor:
                     cdist_km[raw < 0] = -1.0  # nodata → sentinel
                     loaded_data['cdist_km'] = cdist_km
                     print("ST_CDIST загружен — буферная маска доступна")
+                    if progress_callback:
+                        progress_callback('cdist_km', cdist_file)
                 except Exception as e:
                     print(f"Не удалось загрузить ST_CDIST: {e}")
 
@@ -115,6 +123,7 @@ class DataProcessor:
                 shadow_mask  = self._extract_qa_bits(qa_data, [4])
                 snow_mask    = self._extract_qa_bits(qa_data, [5])
                 cirrus_mask  = self._extract_qa_bits(qa_data, [2])
+                data['nodata_mask'] = self._extract_qa_bits(qa_data, [0])  # bit 0 = fill/nodata
                 # Для детектирования: тени включаем по умолчанию.
                 # mask_shadows управляется из UI через set_shadow_masking().
                 data['exclude_mask'] = cloud_mask | shadow_mask | snow_mask | cirrus_mask
