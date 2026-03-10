@@ -1,6 +1,4 @@
-import os
 from pathlib import Path
-from datetime import datetime
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -15,7 +13,7 @@ from app.core.water_detector import WaterDetector
 from app.utils.exporter import ImageExporter
 from app.db import database
 
-from app.gui.workers import AnalysisWorker, LoadWorker
+from app.gui.workers import AnalysisWorker, LoadWorker, ExportWorker
 from app.gui.panels.left_panel import LeftPanel
 from app.gui.panels.center_panel import CenterPanel
 from app.gui.panels.stats_panel import StatsPanel
@@ -33,6 +31,7 @@ class MainWindow(QMainWindow):
         self.detection_results = None
         self.current_scene     = ''
         self._worker           = None
+        self._export_worker    = None
 
         self._build_ui()
         self._build_menu()
@@ -200,20 +199,34 @@ class MainWindow(QMainWindow):
         if not self.detection_results:
             QMessageBox.warning(self, 'Нет результатов', 'Сначала выполните анализ')
             return
+        if self._export_worker and self._export_worker.isRunning():
+            QMessageBox.information(self, 'Экспорт', 'Экспорт уже выполняется...')
+            return
         export_dir = QFileDialog.getExistingDirectory(self, 'Выберите папку для экспорта')
         if not export_dir:
             return
-        success = self.image_exporter.export_results(
-            self.detection_results, self.loaded_data, export_dir
+
+        self.center_panel.btn_export.setEnabled(False)
+        self.act_export.setEnabled(False)
+        self.status.showMessage('Экспорт...')
+
+        self._export_worker = ExportWorker(
+            self.image_exporter, self.detection_results, self.loaded_data, export_dir
         )
+        self._export_worker.progress.connect(self.status.showMessage)
+        self._export_worker.finished.connect(self._on_export_done)
+        self._export_worker.start()
+
+    def _on_export_done(self, success: bool, path: str):
+        self.center_panel.btn_export.setEnabled(True)
+        self.act_export.setEnabled(True)
         if success:
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            excel_path = os.path.join(export_dir, f'Статистика_{ts}.xlsx')
-            self.image_exporter.export_to_excel(self.detection_results, excel_path)
+            self.status.showMessage(f'Экспорт завершён — {path}')
             QMessageBox.information(self, 'Экспорт завершён',
-                                    f'Результаты сохранены:\n{export_dir}')
+                                    f'Результаты сохранены:\n{path}')
         else:
-            QMessageBox.critical(self, 'Ошибка экспорта', 'Не удалось экспортировать результаты')
+            self.status.showMessage('Ошибка экспорта')
+            QMessageBox.critical(self, 'Ошибка экспорта', path)
 
     def _show_history(self):
         dlg = QDialog(self)

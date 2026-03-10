@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+from datetime import datetime
 
 from PySide6.QtCore import QThread, Signal
 
@@ -77,3 +79,38 @@ class AnalysisWorker(QThread):
 
         except Exception as e:
             self.error.emit(str(e))
+
+
+class ExportWorker(QThread):
+    finished = Signal(bool, str)  # success, export_dir или сообщение об ошибке
+    progress = Signal(str)
+
+    def __init__(self, exporter, results, loaded_data, export_dir):
+        super().__init__()
+        self._exporter   = exporter
+        self._results    = results
+        self._loaded_data = loaded_data
+        self._export_dir = export_dir
+
+    def run(self):
+        try:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            self.progress.emit('Экспорт изображений...')
+            self._exporter.export_results(self._results, self._loaded_data, self._export_dir)
+
+            self.progress.emit('Экспорт Excel...')
+            self._exporter.export_to_excel(
+                self._results,
+                os.path.join(self._export_dir, f'Статистика_{ts}.xlsx'),
+            )
+
+            self.progress.emit('Формирование PDF-отчёта...')
+            self._exporter.export_to_pdf(
+                self._results,
+                os.path.join(self._export_dir, f'Отчёт_{ts}.pdf'),
+            )
+
+            self.finished.emit(True, self._export_dir)
+        except Exception as e:
+            self.finished.emit(False, str(e))

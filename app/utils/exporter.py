@@ -3,7 +3,6 @@ import cv2
 from PIL import Image
 import pandas as pd
 import json
-import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 
@@ -141,6 +140,88 @@ GeoScanPro v2.0
 """
         with open(export_dir / "ОТЧЕТ_АНАЛИЗА.txt", 'w', encoding='utf-8') as f:
             f.write(report)
+
+    def export_to_pdf(self, results: dict, export_path: str) -> bool:
+        try:
+            from matplotlib.backends.backend_pdf import PdfPages
+            from matplotlib.figure import Figure
+            from matplotlib.gridspec import GridSpec
+            from app.gui.charts import _draw_area_histogram, _draw_composition_pie
+
+            with PdfPages(export_path) as pdf:
+                fig = Figure(figsize=(8.27, 11.69))  # A4 книжная
+                gs = GridSpec(
+                    3, 3, figure=fig,
+                    height_ratios=[2.4, 1.6, 1.0],
+                    hspace=0.40, wspace=0.28,
+                    left=0.05, right=0.97, top=0.93, bottom=0.05,
+                )
+
+                fig.suptitle(
+                    f'Отчёт по анализу водных объектов — GeoScanPro\n'
+                    f'{datetime.now().strftime("%d.%m.%Y %H:%M:%S")}',
+                    fontsize=12, fontweight='bold',
+                )
+
+                for col, (key, title) in enumerate([
+                    ('rgb_image',       'RGB'),
+                    ('overlay_image',   'Overlay (вода)'),
+                    ('cloud_image_plain', 'Облачность'),
+                ]):
+                    ax = fig.add_subplot(gs[0, col])
+                    arr = results.get(key)
+                    if arr is not None:
+                        arr = np.clip(arr, 0, 1)
+                        h, w = arr.shape[:2]
+                        scale = 600 / max(h, w)
+                        small = cv2.resize(
+                            (arr * 255).astype(np.uint8),
+                            (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        ax.imshow(small)
+                    ax.set_title(title, fontsize=8)
+                    ax.axis('off')
+
+                _draw_area_histogram(fig.add_subplot(gs[1, 0]), results)
+                _draw_composition_pie(fig.add_subplot(gs[1, 1]), results)
+                fig.add_subplot(gs[1, 2]).set_visible(False)
+
+                ax_tbl = fig.add_subplot(gs[2, :])
+                ax_tbl.axis('off')
+
+                rows = [
+                    ['Площадь воды, км²',    f"{results.get('total_water_area_km2', 0):.4f}",
+                     '% воды',               f"{results.get('water_percentage', 0):.2f}%",
+                     '% облаков',            f"{results.get('cloud_percentage', 0):.2f}%"],
+                    ['% суши',               f"{results.get('land_percentage', 0):.2f}%",
+                     'Объектов',             str(results.get('object_count', 0)),
+                     'Крупнейший объект, км²', f"{results.get('largest_object_area', 0):.4f}"],
+                    ['Средний объект, км²',  f"{results.get('average_object_size', 0):.4f}",
+                     'Общий периметр, км',   f"{results.get('total_perimeter_km', 0):.2f}",
+                     '', ''],
+                ]
+                tbl = ax_tbl.table(
+                    cellText=rows,
+                    colLabels=['Показатель', 'Значение', 'Показатель', 'Значение', 'Показатель', 'Значение'],
+                    loc='center', cellLoc='left',
+                )
+                tbl.auto_set_font_size(False)
+                tbl.set_fontsize(8.5)
+                tbl.scale(1, 1.8)
+                for (r, c), cell in tbl.get_celld().items():
+                    if r == 0:
+                        cell.set_facecolor('#dbeafe')
+                    elif c in (0, 2, 4):
+                        cell.set_facecolor('#f8fafc')
+                    cell.set_edgecolor('#e2e8f0')
+
+                pdf.savefig(fig)
+
+            return True
+        except Exception as e:
+            print(f'Ошибка экспорта PDF: {e}')
+            return False
 
     def _normalize_for_display(self, data):
         try:

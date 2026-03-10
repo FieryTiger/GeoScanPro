@@ -251,7 +251,16 @@ class WaterDetector:
 
             total_water_pixels = int(np.sum(water_mask))
             total_area_km2 = total_water_pixels * pixel_area_km2
-            water_percentage = (total_water_pixels / water_mask.size) * 100
+            total_pixels = water_mask.size
+            water_percentage = (total_water_pixels / total_pixels) * 100
+
+            exclude_mask = data.get('exclude_mask')
+            nodata_mask  = data.get('nodata_mask')
+            cloud_pixels = int(np.sum(exclude_mask)) if exclude_mask is not None else 0
+            nodata_pixels = int(np.sum(nodata_mask)) if nodata_mask is not None else 0
+            valid_pixels = total_pixels - nodata_pixels
+            cloud_percentage  = (cloud_pixels / valid_pixels * 100) if valid_pixels > 0 else 0.0
+            land_percentage   = max(0.0, 100.0 - water_percentage - cloud_percentage)
 
             contours, _ = cv2.findContours(water_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -282,6 +291,8 @@ class WaterDetector:
                 'total_water_area_km2': total_area_km2,
                 'total_perimeter_km': total_perimeter_km,
                 'water_percentage': water_percentage,
+                'cloud_percentage': cloud_percentage,
+                'land_percentage': land_percentage,
                 'object_count': len(objects_data),
                 'objects_data': objects_data,
                 'largest_object_area': objects_data[0]['area_km2'] if objects_data else 0,
@@ -342,6 +353,7 @@ class WaterDetector:
                 px = clouds[:, :, np.newaxis]
                 cloud_vis = np.where(px, rgb * 0.2 + np.array([1.0, 0.5, 0.05]) * 0.8, cloud_vis)
             cloud_vis = np.clip(cloud_vis, 0, 1)
+            vis['cloud_image_plain'] = cloud_vis  # без отладочных боксов
             vis['cloud_mask_image'] = self._filler.annotate_bboxes(
                 cloud_vis, water_mask.astype(bool),
                 data.get('exclude_mask'), data.get('nodata_mask')

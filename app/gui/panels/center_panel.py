@@ -208,16 +208,40 @@ class CenterPanel(QWidget):
         self.viewer = ImageViewer()
         layout.addWidget(self.viewer, 1)
 
-        self.placeholder = QLabel('Загрузите данные Landsat 9\nи запустите анализ')
+        self.placeholder = QLabel('Загрузите данные Landsat 9 и запустите анализ')
         self.placeholder.setFont(QFont('Arial', 14))
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setStyleSheet('color: #aaaaaa;')
         layout.addWidget(self.placeholder)
 
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 15, 0)
+
         hint = QLabel('Колёсико - масштаб  |  ЛКМ + перетащить - перемещение')
         hint.setStyleSheet('color: #aaaaaa; font-size: 10px;')
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(hint)
+        bottom_row.addWidget(hint, 1)
+
+        self._btn_charts = QPushButton('ℹ')
+        self._btn_charts.setFixedSize(22, 22)
+        self._btn_charts.setToolTip('Графики: распределение объектов и состав сцены')
+        self._btn_charts.setEnabled(False)
+        self._btn_charts.setStyleSheet("""
+            QPushButton {
+                font-size: 14px;
+                border: 1px solid #3b82f6;
+                border-radius: 11px;
+                color: #3b82f6;
+                background: transparent;
+                padding: 0;
+            }
+            QPushButton:hover { background: rgba(255, 255, 255, 40); }
+            QPushButton:disabled { border-color: #cbd5e1; color: #cbd5e1; }
+        """)
+        self._btn_charts.clicked.connect(self._show_charts)
+        bottom_row.addWidget(self._btn_charts)
+
+        layout.addLayout(bottom_row)
 
         self.sl_brightness.valueChanged.connect(self._apply_enhancement)
         self.sl_contrast.valueChanged.connect(self._apply_enhancement)
@@ -234,6 +258,7 @@ class CenterPanel(QWidget):
         self._retire_current_worker()
         self.placeholder.hide()
         self.btn_export.setEnabled(True)
+        self._btn_charts.setEnabled(True)
         self._switch_view(0)
 
     def highlight_object(self, obj_index: int):
@@ -298,6 +323,12 @@ class CenterPanel(QWidget):
         self._cache_u8[index] = arr_u8
         if index == self._current_view:
             self.viewer.set_image_u8(arr_u8)
+
+    def _show_charts(self):
+        if self.results is None:
+            return
+        from app.gui.charts_dialog import ChartsDialog
+        ChartsDialog(self.results, parent=self).exec()
 
     def _apply_enhancement(self, _=None):
         brightness = self.sl_brightness.value()
