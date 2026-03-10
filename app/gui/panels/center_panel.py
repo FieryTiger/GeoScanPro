@@ -4,10 +4,58 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSlider
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QThread, QTimer
 from PySide6.QtGui import QFont
 
 from app.gui.image_viewer import ImageViewer, _to_uint8
+
+_PREVIEW_PX = 380  # быстрое превью пока идёт фоновый рендер
+
+
+def _get_view_array(index: int, results: dict) -> np.ndarray | None:
+    r = results
+    if index == 0:
+        return r.get('rgb_image')
+    elif index == 1 and 'water_mask' in r:
+        mask = r['water_mask'].astype(bool)
+        arr = np.empty((*mask.shape, 3), dtype=np.float32)
+        arr[:] = [0.88, 0.88, 0.88]
+        arr[mask] = [0.2, 0.5, 1.0]
+        return arr
+    elif index == 2:
+        return r.get('overlay_image')
+    elif index == 3:
+        return r.get('contour_image')
+    elif index == 4:
+        return r.get('cloud_mask_image')
+    return None
+
+
+class RenderWorker(QThread):
+    preview_ready = Signal(int, object)  # (view_index, arr_u8 preview)
+    full_ready    = Signal(int, object)  # (view_index, arr_u8 full)
+
+    def __init__(self, index: int, results: dict, max_px: int):
+        super().__init__()
+        self._index   = index
+        self._results = results
+        self._max_px  = max_px
+
+    def run(self):
+        arr = _get_view_array(self._index, self._results)
+        if arr is None:
+            return
+
+        # Этап 1: маленькое превью
+        preview = _to_uint8(arr, _PREVIEW_PX)
+        if not self.isInterruptionRequested():
+            self.preview_ready.emit(self._index, preview)
+
+        # Этап 2: полное качество
+        if not self.isInterruptionRequested():
+            full = _to_uint8(arr, self._max_px)
+            if not self.isInterruptionRequested():
+                self.full_ready.emit(self._index, full)
 
 
 class ViewButton(QPushButton):
@@ -88,10 +136,19 @@ class CenterPanel(QWidget):
         super().__init__()
         self.results = None
         self._orig_shape: tuple[int, int] | None = None
-        self._cache: dict[int, np.ndarray] = {}      # float32 массивы по индексу вида
-        self._cache_u8: dict[int, np.ndarray] = {}   # uint8 ресайзнутые — для быстрого показа
+        self._cache_u8: dict[int, np.ndarray] = {}       # uint8 кеш полного качества
+        self._cache_preview: dict[int, np.ndarray] = {}  # uint8 кеш 380px превью
         self._current_view = 0
-        self._max_px = 1600  # максимальный размер стороны при отображении
+        self._max_px = 1600
+        self._render_worker: RenderWorker | None = None
+        # Retiring-воркеры: держим Python-ссылку пока поток не завершится,
+        # иначе GC удаляет обёртку раньше C++ потока, получаем краш
+        self._retiring: list[RenderWorker] = []
+        # Debounce для слайдера качества
+        self._quality_timer = QTimer()
+        self._quality_timer.setSingleShot(True)
+        self._quality_timer.setInterval(250)
+        self._quality_timer.timeout.connect(self._apply_quality_change)
         self._build_ui()
 
     def _build_ui(self):
@@ -107,7 +164,6 @@ class CenterPanel(QWidget):
         tb_layout.setSpacing(6)
         tb_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        # View buttons
         view_labels = ['RGB', 'Маска', 'Overlay', 'Контуры', 'Облака']
         self._view_btns: list[ViewButton] = []
         for i, lbl in enumerate(view_labels):
@@ -119,16 +175,14 @@ class CenterPanel(QWidget):
 
         tb_layout.addSpacing(12)
 
-        # Enhancement sliders
-        self.sl_brightness = LabeledSlider('Яркость',   -100, 100, 0)
-        self.sl_contrast   = LabeledSlider('Контраст',   -50, 150, 0)
-        self.sl_sharpness  = LabeledSlider('Резкость',     0, 100, 0)
+        self.sl_brightness = LabeledSlider('Яркость',  -100, 100, 0)
+        self.sl_contrast   = LabeledSlider('Контраст',  -50, 150, 0)
+        self.sl_sharpness  = LabeledSlider('Резкость',    0, 100, 0)
         for sl in (self.sl_brightness, self.sl_contrast, self.sl_sharpness):
             tb_layout.addWidget(sl)
 
         tb_layout.addSpacing(8)
 
-        # Качество отображения (макс. размер стороны в пикселях)
         self.sl_quality = LabeledSlider('Разр.', 600, 2400, self._max_px, 200)
         self.sl_quality.slider.setFixedWidth(80)
         tb_layout.addWidget(self.sl_quality)
@@ -151,39 +205,36 @@ class CenterPanel(QWidget):
 
         layout.addWidget(toolbar)
 
-        # ---- Image viewer ----
         self.viewer = ImageViewer()
         layout.addWidget(self.viewer, 1)
 
-        # Placeholder
         self.placeholder = QLabel('Загрузите данные Landsat 9\nи запустите анализ')
         self.placeholder.setFont(QFont('Arial', 14))
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.placeholder.setStyleSheet('color: #aaaaaa;')
         layout.addWidget(self.placeholder)
 
-        # Hint
         hint = QLabel('Колёсико - масштаб  |  ЛКМ + перетащить - перемещение')
         hint.setStyleSheet('color: #aaaaaa; font-size: 10px;')
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint)
 
-        # Connections
         self.sl_brightness.valueChanged.connect(self._apply_enhancement)
         self.sl_contrast.valueChanged.connect(self._apply_enhancement)
         self.sl_sharpness.valueChanged.connect(self._apply_enhancement)
         self.sl_quality.valueChanged.connect(self._on_quality_change)
 
     # Public API
+
     def show_results(self, results: dict, orig_shape: tuple[int, int]):
         self.results = results
         self._orig_shape = orig_shape
-        self._cache.clear()
         self._cache_u8.clear()
+        self._cache_preview.clear()
+        self._retire_current_worker()
         self.placeholder.hide()
         self.btn_export.setEnabled(True)
         self._switch_view(0)
-        self.viewer.reset_zoom()  # сброс зума только при новых результатах
 
     def highlight_object(self, obj_index: int):
         if not self.results or self._orig_shape is None:
@@ -194,25 +245,59 @@ class CenterPanel(QWidget):
             self.viewer.highlight_object(contour, self._orig_shape)
 
     # Internal
+
     def _switch_view(self, index: int):
+        prev_view = self._current_view
         self._current_view = index
         for i, btn in enumerate(self._view_btns):
             btn.mark_active(i == index)
-        arr_u8 = self._get_u8(index)
-        if arr_u8 is not None:
-            # set_image_u8: без ресайза и float-конвертации, зум не сбрасывается
+
+        if self.results is None:
+            return
+
+        if index in self._cache_u8:
+            self.viewer.set_image_u8(self._cache_u8[index])
+            return
+
+        if index in self._cache_preview:
+            self.viewer.set_image_u8(self._cache_preview[index])
+        elif prev_view in self._cache_preview:
+            self.viewer.set_image_u8(self._cache_preview[prev_view])
+
+        self._start_render(index)
+
+    def _start_render(self, index: int):
+        self._retire_current_worker()
+        self._render_worker = RenderWorker(index, self.results, self._max_px)
+        self._render_worker.preview_ready.connect(self._on_preview_ready)
+        self._render_worker.full_ready.connect(self._on_full_ready)
+        self._render_worker.start()
+
+    def _retire_current_worker(self):
+        """Отправляет текущий воркер на пенсию: прерывает, отключает сигналы,
+        но НЕ ждёт - Python-ссылка живёт в _retiring пока поток не завершится."""
+        w = self._render_worker
+        if w is None:
+            return
+        w.requestInterruption()
+        try:
+            w.preview_ready.disconnect()
+            w.full_ready.disconnect()
+        except RuntimeError:
+            pass
+        self._retiring.append(w)
+        w.finished.connect(lambda: self._retiring.remove(w) if w in self._retiring else None)
+        self._render_worker = None
+
+    def _on_preview_ready(self, index: int, arr_u8: np.ndarray):
+        self._cache_preview[index] = arr_u8  # кешируем для быстрого показа при следующем свопе
+        if index == self._current_view:
             self.viewer.set_image_u8(arr_u8)
 
-    def _get_u8(self, index: int) -> np.ndarray | None:
-        """Возвращает кешированный uint8 массив для текущего _max_px."""
-        if index in self._cache_u8:
-            return self._cache_u8[index]
-        arr = self._get_array(index)
-        if arr is None:
-            return None
-        arr_u8 = _to_uint8(arr, self._max_px)
+    def _on_full_ready(self, index: int, arr_u8: np.ndarray):
         self._cache_u8[index] = arr_u8
-        return arr_u8
+        if index == self._current_view:
+            self.viewer.set_image_u8(arr_u8)
 
     def _apply_enhancement(self, _=None):
         brightness = self.sl_brightness.value()
@@ -222,33 +307,9 @@ class CenterPanel(QWidget):
 
     def _on_quality_change(self, v: int):
         self._max_px = v
-        self._cache_u8.clear()  # сбрасываем кеш — нужен ресайз под новый размер
-        arr_u8 = self._get_u8(self._current_view)
-        if arr_u8 is not None:
-            self.viewer.set_image_u8(arr_u8)
+        self._quality_timer.start()
 
-    def _get_array(self, index: int) -> np.ndarray | None:
-        if index in self._cache:
-            return self._cache[index]
-        if self.results is None:
-            return None
-
-        r = self.results
-        arr = None
-
-        if index == 0:
-            arr = r.get('rgb_image')
-        elif index == 1 and 'water_mask' in r:
-            mask = r['water_mask']
-            arr = np.where(mask[:, :, np.newaxis], [0.2, 0.5, 1.0], [0.88, 0.88, 0.88])
-            arr = arr.astype(np.float32)
-        elif index == 2:
-            arr = r.get('overlay_image')
-        elif index == 3:
-            arr = r.get('contour_image')
-        elif index == 4:
-            arr = r.get('cloud_mask_image')
-
-        if arr is not None:
-            self._cache[index] = arr
-        return arr
+    def _apply_quality_change(self):
+        self._cache_u8.clear()
+        if self.results is not None:
+            self._start_render(self._current_view)
