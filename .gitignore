@@ -12,3 +12,4 @@ temp_extracted/
 *.egg-info/
 build/
 dist/
+local_assets/
