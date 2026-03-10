@@ -3,18 +3,19 @@ import cv2
 
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem
 from PySide6.QtGui import QPixmap, QImage, QPainter, QWheelEvent, QPen, QColor
-from PySide6.QtCore import Qt, QRectF
+from PySide6.QtCore import Qt, QRectF, QPointF
 
 
 def _to_uint8(arr: np.ndarray, max_px: int = 2000) -> np.ndarray:
-    if arr.dtype != np.uint8:
-        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
     if arr.ndim == 2:
         arr = np.stack([arr] * 3, axis=-1)
     h, w = arr.shape[:2]
+    # Сначала ресайз на float32 (маленький буфер), потом конвертация.
     if max(h, w) > max_px:
         scale = max_px / max(h, w)
         arr = cv2.resize(arr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    if arr.dtype != np.uint8:
+        arr = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
     return np.ascontiguousarray(arr)
 
 
@@ -42,18 +43,17 @@ class ImageViewer(QGraphicsView):
         self._fit_transform = None
         self._user_zoomed = False
 
-        # Enhancement params
+        self._pixmap_w: int | None = None
+        self._pixmap_h: int | None = None
+
         self._base_arr_u8: np.ndarray | None = None
-        self._orig_shape: tuple[int, int] | None = None
-        self._brightness = 0      # -100 .. 100
-        self._contrast   = 1.0    # 0.5 .. 3.0
-        self._sharpness  = 0.0    # 0.0 .. 3.0
+        self._brightness = 0
+        self._contrast   = 1.0
+        self._sharpness  = 0.0
 
     # Public API
 
     def set_image(self, arr: np.ndarray, reset_zoom: bool = False):
-        """float32 [0..1] или uint8, (H,W) или (H,W,3). Зум не сбрасывается по умолчанию."""
-        self._orig_shape = arr.shape[:2]
         self._base_arr_u8 = _to_uint8(arr)
         self.clear_highlight()
         self._apply_and_show(reset_zoom=reset_zoom)
@@ -114,42 +114,87 @@ class ImageViewer(QGraphicsView):
     # Internal
 
     def _apply_and_show(self, reset_zoom: bool):
-        # Пропускаем float-конвертацию если enhancement на дефолтах
+        # Enhancement (пропускаем float-конвертацию на дефолтах)
         if self._brightness == 0 and self._contrast == 1.0 and self._sharpness == 0.0:
             arr = self._base_arr_u8
         else:
             arr = self._base_arr_u8.astype(np.float32)
-
             if self._brightness != 0:
                 arr += self._brightness
-
             if self._contrast != 1.0:
                 arr = (arr - 128.0) * self._contrast + 128.0
-
             arr = np.clip(arr, 0, 255).astype(np.uint8)
-
             if self._sharpness > 0.0:
                 blurred = cv2.GaussianBlur(arr, (0, 0), 2.0)
                 arr = cv2.addWeighted(arr, 1.0 + self._sharpness, blurred, -self._sharpness, 0)
                 arr = np.clip(arr, 0, 255).astype(np.uint8)
 
         arr = np.ascontiguousarray(arr)
+        new_h, new_w = arr.shape[:2]
         pixmap = _arr_to_pixmap(arr)
+
+        size_changed = (new_w != self._pixmap_w or new_h != self._pixmap_h)
+
+        saved_norm = None
+        if self._user_zoomed and not reset_zoom and size_changed and self._pixmap_w:
+            vtl = self.mapToScene(self.viewport().rect().topLeft())
+            vbr = self.mapToScene(self.viewport().rect().bottomRight())
+            saved_norm = (
+                (vtl.x() / self._pixmap_w, vtl.y() / self._pixmap_h),
+                (vbr.x() / self._pixmap_w, vbr.y() / self._pixmap_h),
+            )
 
         if self._pixmap_item is None:
             self._pixmap_item = self._scene.addPixmap(pixmap)
         else:
             self._pixmap_item.setPixmap(pixmap)
 
+        self._pixmap_w = new_w
+        self._pixmap_h = new_h
+
         r = self._pixmap_item.boundingRect()
         pad = max(r.width(), r.height())
         self._scene.setSceneRect(r.adjusted(-pad, -pad, pad, pad))
 
         if reset_zoom:
+            # Явный сброс (новые результаты)
             self._user_zoomed = False
             self.resetTransform()
             self.fit()
             self._fit_transform = self.transform()
+
+        elif not self._user_zoomed:
+            self.resetTransform()
+            self.fit()
+            self._fit_transform = self.transform()
+
+        elif saved_norm:
+            (ntl, nbr) = saved_norm
+            new_tl = QPointF(ntl[0] * new_w, ntl[1] * new_h)
+            new_br = QPointF(nbr[0] * new_w, nbr[1] * new_h)
+
+            self.fitInView(QRectF(new_tl, new_br), Qt.AspectRatioMode.KeepAspectRatio)
+            restored = self.transform()
+            new_center = QPointF(
+                (ntl[0] + nbr[0]) / 2 * new_w,
+                (ntl[1] + nbr[1]) / 2 * new_h,
+            )
+
+            self.resetTransform()
+            self.fit()
+            self._fit_transform = self.transform()
+            self.setTransform(restored)
+            self.centerOn(new_center)  # pan тоже восстанавливаем через centerOn
+            self._user_zoomed = True
+
+        else:
+            scene_center = self.mapToScene(self.viewport().rect().center())
+            current = self.transform()
+            self.resetTransform()
+            self.fit()
+            self._fit_transform = self.transform()
+            self.setTransform(current)
+            self.centerOn(scene_center)
 
     # Qt events
 
