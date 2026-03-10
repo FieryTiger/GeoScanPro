@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont, QColor, QPixmap
 
 from app.core.data_processor import DataProcessor
+from app.gui.workers import LoadWorker
 
 
 BAND_INFO = {
@@ -22,7 +23,7 @@ BAND_INFO = {
     'QA_PIXEL': ('QA',  'Quality','#888888'),
 }
 
-# Опциональные каналы — отсутствие не блокирует анализ, но ограничивает возможности
+# Опциональные каналы
 OPTIONAL_BAND_INFO = {
     'st_celsius': ('ST',  'Thermal (B10)', '#E8A020'),
     'cdist_km':   ('CD',  'Cloud Dist',    '#E8A020'),
@@ -118,10 +119,13 @@ class OptionalBandRow(QWidget):
 class LeftPanel(QScrollArea):
     files_loaded      = Signal(list)   # пути к .tif файлам
     analysis_requested = Signal(dict)  # параметры детектирования
+    load_progress     = Signal(str)
 
     def __init__(self, data_processor: DataProcessor):
         super().__init__()
         self.data_processor = data_processor
+        self._load_worker = None
+        self._loading_files: list = []
 
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -259,7 +263,7 @@ class LeftPanel(QScrollArea):
         self.chk_shadows.setToolTip(
             'Исключать тени облаков из детектирования.\n'
             'Снимите, если тени падают на водоёмы и создают дыры в маске.\n'
-            'В этом случае рекомендуется включить "Заполнить под облаками".'
+            'В этом случае рекомендуется включить «Заполнить под облаками».'
         )
         layout.addWidget(self.chk_shadows)
 
@@ -292,12 +296,40 @@ class LeftPanel(QScrollArea):
         layout.addLayout(gap_row)
 
         self.chk_spatial_fill = QCheckBox('Заполнить под облаками')
-        self.chk_spatial_fill.setChecked(False)
+        self.chk_spatial_fill.setChecked(True)
         self.chk_spatial_fill.setFont(QFont('Arial', 12))
         self.chk_spatial_fill.setToolTip(
-            'Пиксели облаков, полностью окружённые водой,\nклассифицируются как вода.'
+            'Тени и облака внутри водоёма заполняются как вода.\n'
+            'Тени от облаков мешают детектированию воды — эта опция восстанавливает пропущенные участки.\n'
+            'Компонент заполняется если ≥70% его границы окружено водой.'
         )
         layout.addWidget(self.chk_spatial_fill)
+
+        fill_row = QHBoxLayout()
+        fill_row.setContentsMargins(16, 0, 0, 0)
+        fill_lbl = QLabel('Мин. площадь, пикс.:')
+        fill_lbl.setFont(QFont('Arial', 12))
+        self.spin_min_fill_area = QSpinBox()
+        self.spin_min_fill_area.setRange(1, 100000)
+        self.spin_min_fill_area.setValue(20)
+        self.spin_min_fill_area.setToolTip('Минимальная площадь тени/облака для заполнения.')
+        fill_row.addWidget(fill_lbl)
+        fill_row.addWidget(self.spin_min_fill_area)
+        layout.addLayout(fill_row)
+
+        frac_row = QHBoxLayout()
+        frac_row.setContentsMargins(16, 0, 0, 0)
+        frac_lbl = QLabel('Мин. окружение водой:')
+        frac_lbl.setFont(QFont('Arial', 12))
+        self.spin_fill_frac = QDoubleSpinBox()
+        self.spin_fill_frac.setRange(0.1, 1.0)
+        self.spin_fill_frac.setSingleStep(0.05)
+        self.spin_fill_frac.setDecimals(2)
+        self.spin_fill_frac.setValue(0.50)
+        self.spin_fill_frac.setToolTip('Доля границы тени/облака окружённой водой (0.5 = 50%).\nМеньше = заполняет агрессивнее, больше = строже.')
+        frac_row.addWidget(frac_lbl)
+        frac_row.addWidget(self.spin_fill_frac)
+        layout.addLayout(frac_row)
 
         # Разделитель
         sep2 = QFrame()
@@ -354,6 +386,62 @@ class LeftPanel(QScrollArea):
         layout.addLayout(cdist_row)
 
         self.chk_cdist.toggled.connect(self.spin_cdist_km.setEnabled)
+
+        # Разделитель
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet('color: #cccccc;')
+        layout.addWidget(sep3)
+
+        # Буфер QA-маски
+        buf_row = QHBoxLayout()
+        buf_lbl = QLabel('Буфер QA, пикс.:')
+        buf_lbl.setFont(QFont('Arial', 12))
+        self.spin_cloud_buffer = QSpinBox()
+        self.spin_cloud_buffer.setRange(0, 15)
+        self.spin_cloud_buffer.setValue(0)
+        self.spin_cloud_buffer.setToolTip(
+            'Расширяет QA-маску облаков на N пикселей.\n'
+            'Захватывает "чёрную мешанину" по краям облаков (cloud adjacency effect).\n'
+            'Расширенные пиксели восстанавливаются spatial fill если окружены водой.\n'
+            '2–4 пикс. обычно достаточно.'
+        )
+        buf_row.addWidget(buf_lbl)
+        buf_row.addWidget(self.spin_cloud_buffer)
+        layout.addLayout(buf_row)
+
+        # HOT-маска
+        self.chk_hot = QCheckBox('HOT-маска (дымка/хейз)')
+        self.chk_hot.setChecked(False)
+        self.chk_hot.setFont(QFont('Arial', 12))
+        self.chk_hot.setToolTip(
+            'Haze Optimized Transform: HOT = Blue − 0.5 × Red.\n'
+            'Высокий HOT → полупрозрачное облако или дымка.\n'
+            'Маскирует пиксели с HOT выше порога, затем spatial fill восстанавливает их.\n'
+            'Не требует дополнительных файлов.'
+        )
+        layout.addWidget(self.chk_hot)
+
+        hot_row = QHBoxLayout()
+        hot_row.setContentsMargins(16, 0, 0, 0)
+        hot_lbl = QLabel('Порог HOT:')
+        hot_lbl.setFont(QFont('Arial', 12))
+        self.spin_hot_threshold = QDoubleSpinBox()
+        self.spin_hot_threshold.setRange(0.01, 0.80)
+        self.spin_hot_threshold.setSingleStep(0.01)
+        self.spin_hot_threshold.setDecimals(2)
+        self.spin_hot_threshold.setValue(0.05)
+        self.spin_hot_threshold.setEnabled(False)
+        self.spin_hot_threshold.setToolTip(
+            'Пиксели с HOT > порога маскируются как облако.\n'
+            '0.05 — мягко, 0.03 — агрессивнее.'
+        )
+        hot_row.addWidget(hot_lbl)
+        hot_row.addWidget(self.spin_hot_threshold)
+        hot_row.addStretch()
+        layout.addLayout(hot_row)
+
+        self.chk_hot.toggled.connect(self.spin_hot_threshold.setEnabled)
 
         self._layout.addWidget(grp)
 
@@ -416,7 +504,7 @@ class LeftPanel(QScrollArea):
 
     def show_metadata(self, meta: dict):
         self.lbl_date.setText(f"{meta.get('date', '—')}  {meta.get('time', '')}")
-        self.lbl_cloud.setText(f"блачность: {meta.get('cloud_cover', '—')}%")
+        self.lbl_cloud.setText(f"Облачность: {meta.get('cloud_cover', '—')}%")
         self.lbl_sun.setText(f"Угол Солнца: {meta.get('sun_elevation', '—')}°")
         self.lbl_path.setText(f"Path/Row: {meta.get('wrs_path', '—')}/{meta.get('wrs_row', '—')}")
         self.meta_group.setVisible(True)
@@ -448,7 +536,7 @@ class LeftPanel(QScrollArea):
             self, 'Выберите файлы Landsat 9', '', 'TIFF (*.tif *.TIF *.tiff)'
         )
         if files:
-            self._load_and_emit(files)
+            self._start_load(files)
 
     def load_archive(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -470,22 +558,49 @@ class LeftPanel(QScrollArea):
             tif_files = [str(f) for f in temp_dir.rglob('*.tif')] + \
                         [str(f) for f in temp_dir.rglob('*.TIF')]
             if tif_files:
-                self._load_and_emit(tif_files)
+                self._start_load(tif_files)
             else:
                 QMessageBox.warning(self, 'Файлы не найдены', 'В архиве нет .tif файлов')
         except Exception as e:
             QMessageBox.critical(self, 'Ошибка', f'Не удалось извлечь архив:\n{e}')
 
-    def _load_and_emit(self, file_paths: list):
-        loaded = self.data_processor.load_landsat_data(file_paths)
-        if loaded:
-            self.set_bands_status(loaded)
-            self.btn_run.setEnabled(True)
-            self.files_loaded.emit(file_paths)
-        else:
-            QMessageBox.critical(self, 'Ошибка загрузки',
-                                 'Не удалось загрузить необходимые каналы Landsat 9.\n'
-                                 'Убедитесь что все SR_B2–B7 и QA_PIXEL файлы присутствуют.')
+    def _start_load(self, file_paths: list):
+        self._loading_files = file_paths
+        self.btn_files.setEnabled(False)
+        self.btn_archive.setEnabled(False)
+        self.btn_run.setEnabled(False)
+        # Reset all band rows to loading state
+        for row in self.band_rows.values():
+            row.reset()
+        for row in self.optional_rows.values():
+            row.reset()
+
+        self._load_worker = LoadWorker(self.data_processor, file_paths)
+        self._load_worker.band_loaded.connect(self._on_band_loaded)
+        self._load_worker.finished.connect(self._on_load_finished)
+        self._load_worker.error.connect(self._on_load_error)
+        self._load_worker.progress.connect(self.load_progress)
+        self._load_worker.start()
+
+    def _on_band_loaded(self, band_key: str):
+        """Вызывается из LoadWorker по мере загрузки каждого канала."""
+        if band_key in self.band_rows:
+            self.band_rows[band_key].set_found(True)
+        elif band_key in self.optional_rows:
+            self.optional_rows[band_key].set_status(True)
+
+    def _on_load_finished(self, loaded_data: object):
+        self.btn_files.setEnabled(True)
+        self.btn_archive.setEnabled(True)
+        self.set_bands_status(loaded_data)
+        self.btn_run.setEnabled(True)
+        self.files_loaded.emit(self._loading_files)
+
+    def _on_load_error(self, msg: str):
+        self.btn_files.setEnabled(True)
+        self.btn_archive.setEnabled(True)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.critical(None, 'Ошибка загрузки', msg)
 
     def _emit_analysis(self):
         self.analysis_requested.emit({
@@ -494,10 +609,15 @@ class LeftPanel(QScrollArea):
             'apply_morphology': self.chk_morph.isChecked(),
             'merge_gap_px': self.spin_merge_gap.value(),
             'spatial_fill': self.chk_spatial_fill.isChecked(),
+            'min_fill_area': self.spin_min_fill_area.value(),
+            'fill_water_frac': self.spin_fill_frac.value(),
             'mask_shadows': self.chk_shadows.isChecked(),
             'use_thermal_mask': self.chk_thermal.isChecked(),
             'thermal_temp_c': self.spin_thermal_temp.value(),
             'thermal_bright_threshold': 0.12,
             'use_cdist_buffer': self.chk_cdist.isChecked(),
             'cdist_buffer_km': self.spin_cdist_km.value(),
+            'cloud_buffer_px': self.spin_cloud_buffer.value(),
+            'use_hot_mask': self.chk_hot.isChecked(),
+            'hot_threshold': self.spin_hot_threshold.value(),
         })
