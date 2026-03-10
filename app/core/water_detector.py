@@ -19,9 +19,22 @@ class WaterDetector:
         self.spatial_fill = False  # заполнять облачные пиксели окружённые водой
         self.mask_shadows = True   # исключать тени облаков из детектирования
 
+        # Температурная маска: холодный И яркий пиксель = незамаскированное облако/цирус
+        # Требует ST_B10. Не включать если в сцене есть холодная открытая вода (~0°C) без льда.
+        self.use_thermal_mask = False
+        self.thermal_temp_c = 5.0          # порог температуры (°C), ниже = подозрительно холодно
+        self.thermal_bright_threshold = 0.12  # порог яркости (green SR_B3), выше = не вода
+
+        # CDIST-буфер: расширить облачную маску на N км от края облака
+        # Требует ST_CDIST. Ловит переходные зоны и края облаков, пропущенные QA.
+        self.use_cdist_buffer = False
+        self.cdist_buffer_km = 0.3
+
     def set_parameters(self, thresholds=None, min_object_size=None,
                        apply_morphology=None, merge_gap_px=None, spatial_fill=None,
-                       mask_shadows=None):
+                       mask_shadows=None, use_thermal_mask=None, thermal_temp_c=None,
+                       thermal_bright_threshold=None, use_cdist_buffer=None,
+                       cdist_buffer_km=None):
         if thresholds:
             self.thresholds.update(thresholds)
         if min_object_size is not None:
@@ -34,6 +47,16 @@ class WaterDetector:
             self.spatial_fill = spatial_fill
         if mask_shadows is not None:
             self.mask_shadows = mask_shadows
+        if use_thermal_mask is not None:
+            self.use_thermal_mask = use_thermal_mask
+        if thermal_temp_c is not None:
+            self.thermal_temp_c = thermal_temp_c
+        if thermal_bright_threshold is not None:
+            self.thermal_bright_threshold = thermal_bright_threshold
+        if use_cdist_buffer is not None:
+            self.use_cdist_buffer = use_cdist_buffer
+        if cdist_buffer_km is not None:
+            self.cdist_buffer_km = cdist_buffer_km
 
     def detect_water(self, data):
         """Основной метод детектирования водных объектов"""
@@ -51,6 +74,7 @@ class WaterDetector:
                 detect_mask = data.get('exclude_mask')        # облака + тени + снег + цирус
             else:
                 detect_mask = data.get('cloud_only_mask')     # только облака + снег + цирус
+            detect_mask = self._enhance_cloud_mask(detect_mask, data)
             water_mask = self._ensemble_voting(binary_masks, detect_mask)
 
             if self.apply_morphology:
@@ -118,7 +142,7 @@ class WaterDetector:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
             water_mask = cv2.morphologyEx(water_mask, cv2.MORPH_CLOSE, kernel)
             water_mask = cv2.morphologyEx(water_mask, cv2.MORPH_OPEN, kernel)
-            cleaned = morphology.remove_small_holes(water_mask.astype(bool), area_threshold=100)
+            cleaned = morphology.remove_small_holes(water_mask.astype(bool), max_size=100)
             return cleaned.astype(np.uint8)
         except Exception as e:
             print(f"Ошибка морфологических операций: {e}")
@@ -126,7 +150,7 @@ class WaterDetector:
 
     def _remove_small_objects(self, water_mask):
         try:
-            cleaned = morphology.remove_small_objects(water_mask.astype(bool), min_size=self.min_object_size)
+            cleaned = morphology.remove_small_objects(water_mask.astype(bool), max_size=self.min_object_size)
             return cleaned.astype(np.uint8)
         except Exception as e:
             print(f"Ошибка удаления мелких объектов: {e}")
@@ -180,6 +204,41 @@ class WaterDetector:
         except Exception as e:
             print(f"Ошибка анализа объектов: {e}")
             return {}
+
+    def _enhance_cloud_mask(self, base_mask, data):
+        """Дополняет базовую QA-маску температурной и/или CDIST-буферной маской."""
+        enhanced = base_mask
+        if self.use_thermal_mask and 'st_celsius' in data:
+            thermal = self._build_thermal_mask(data)
+            if thermal is not None:
+                enhanced = thermal if enhanced is None else (enhanced | thermal)
+        if self.use_cdist_buffer and 'cdist_km' in data:
+            cdist = self._build_cdist_mask(data)
+            if cdist is not None:
+                enhanced = cdist if enhanced is None else (enhanced | cdist)
+        return enhanced
+
+    def _build_thermal_mask(self, data):
+        """
+        Холодный + яркий пиксель = незамаскированное облако или цирус.
+        Вода холодная, но тёмная (green < threshold) → не попадает под маску.
+        """
+        st = data.get('st_celsius')
+        green = data.get('SR_B3')
+        if st is None or green is None:
+            return None
+        # np.nan < threshold → False, поэтому nodata-пиксели автоматически исключаются
+        return (st < self.thermal_temp_c) & (green > self.thermal_bright_threshold)
+
+    def _build_cdist_mask(self, data):
+        """
+        Пиксели в радиусе cdist_buffer_km от края облака — переходная зона,
+        часто пропускаемая QA. CDIST=0 уже покрыт QA, берём только > 0.
+        """
+        cdist = data.get('cdist_km')
+        if cdist is None:
+            return None
+        return (cdist > 0) & (cdist < self.cdist_buffer_km)
 
     def _merge_nearby_objects(self, water_mask, gap_px: int):
         """Closing с большим ядром - сшивает объекты ближе gap_px пикселей."""

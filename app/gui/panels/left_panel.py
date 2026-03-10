@@ -22,6 +22,12 @@ BAND_INFO = {
     'QA_PIXEL': ('QA',  'Quality','#888888'),
 }
 
+# Опциональные каналы — отсутствие не блокирует анализ, но ограничивает возможности
+OPTIONAL_BAND_INFO = {
+    'st_celsius': ('ST',  'Thermal (B10)', '#E8A020'),
+    'cdist_km':   ('CD',  'Cloud Dist',    '#E8A020'),
+}
+
 
 class BandRow(QWidget):
     def __init__(self, band_key: str):
@@ -55,6 +61,54 @@ class BandRow(QWidget):
         else:
             self.status.setText('✗')
             self.status.setStyleSheet('color: #FF4444; font-weight: bold;')
+
+    def set_optional(self, found: bool):
+        """Для опциональных каналов: жёлтый круг если отсутствует, зелёная галка если есть."""
+        if found:
+            self.status.setText('✓')
+            self.status.setStyleSheet('color: #44BB44; font-weight: bold;')
+        else:
+            self.status.setText('●')
+            self.status.setStyleSheet('color: #E8A020; font-weight: bold;')
+
+    def reset(self):
+        self.status.setText('—')
+        self.status.setStyleSheet('color: #888888;')
+
+
+class OptionalBandRow(QWidget):
+    """Строка для опционального канала: жёлтый круг если отсутствует, зелёная галка если есть."""
+    def __init__(self, short: str, name: str, color: str, tooltip: str = ''):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(6)
+
+        dot = QLabel('●')
+        dot.setStyleSheet(f'color: {color}; font-size: 14px;')
+        dot.setFixedWidth(16)
+
+        label = QLabel(f'{short}  {name}')
+        label.setFont(QFont('Arial', 12))
+
+        self.status = QLabel('—')
+        self.status.setFont(QFont('Arial', 12))
+        self.status.setAlignment(Qt.AlignmentFlag.AlignRight)
+
+        layout.addWidget(dot)
+        layout.addWidget(label, 1)
+        layout.addWidget(self.status)
+
+        if tooltip:
+            self.setToolTip(tooltip)
+
+    def set_status(self, found: bool):
+        if found:
+            self.status.setText('✓')
+            self.status.setStyleSheet('color: #44BB44; font-weight: bold;')
+        else:
+            self.status.setText('●')
+            self.status.setStyleSheet('color: #E8A020; font-weight: bold;')
 
     def reset(self):
         self.status.setText('—')
@@ -131,6 +185,22 @@ class LeftPanel(QScrollArea):
         for key in BAND_INFO:
             row = BandRow(key)
             self.band_rows[key] = row
+            layout.addWidget(row)
+
+        # Разделитель перед опциональными каналами
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet('color: #cccccc;')
+        layout.addWidget(sep)
+
+        self.optional_rows: dict[str, 'OptionalBandRow'] = {}
+        tooltips = {
+            'st_celsius': 'ST_B10 — температура поверхности.\nНужен для температурной маски облаков.',
+            'cdist_km':   'ST_CDIST — расстояние до ближайшего облака.\nНужен для буферной маски краёв облаков.',
+        }
+        for key, (short, name, color) in OPTIONAL_BAND_INFO.items():
+            row = OptionalBandRow(short, name, color, tooltips.get(key, ''))
+            self.optional_rows[key] = row
             layout.addWidget(row)
 
         self._layout.addWidget(grp)
@@ -229,6 +299,62 @@ class LeftPanel(QScrollArea):
         )
         layout.addWidget(self.chk_spatial_fill)
 
+        # Разделитель
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet('color: #cccccc;')
+        layout.addWidget(sep2)
+
+        # Температурная маска
+        self.chk_thermal = QCheckBox('Темп. маска (ST_B10)')
+        self.chk_thermal.setChecked(False)
+        self.chk_thermal.setFont(QFont('Arial', 12))
+        self.chk_thermal.setEnabled(False)
+        self.chk_thermal.setToolTip('Требуется файл ST_B10.\nХолодный + яркий пиксель = незамаскированное облако.')
+        layout.addWidget(self.chk_thermal)
+
+        thermal_row = QHBoxLayout()
+        thermal_row.setContentsMargins(16, 0, 0, 0)
+        t_lbl = QLabel('Порог °C:')
+        t_lbl.setFont(QFont('Arial', 12))
+        self.spin_thermal_temp = QDoubleSpinBox()
+        self.spin_thermal_temp.setRange(-20.0, 20.0)
+        self.spin_thermal_temp.setSingleStep(0.5)
+        self.spin_thermal_temp.setDecimals(1)
+        self.spin_thermal_temp.setValue(5.0)
+        self.spin_thermal_temp.setEnabled(False)
+        thermal_row.addWidget(t_lbl)
+        thermal_row.addWidget(self.spin_thermal_temp)
+        thermal_row.addStretch()
+        layout.addLayout(thermal_row)
+
+        self.chk_thermal.toggled.connect(self.spin_thermal_temp.setEnabled)
+
+        # CDIST буфер
+        self.chk_cdist = QCheckBox('Буфер облаков (ST_CDIST)')
+        self.chk_cdist.setChecked(False)
+        self.chk_cdist.setFont(QFont('Arial', 12))
+        self.chk_cdist.setEnabled(False)
+        self.chk_cdist.setToolTip('Требуется файл ST_CDIST.\nУбирает ложные объекты на краях облаков.')
+        layout.addWidget(self.chk_cdist)
+
+        cdist_row = QHBoxLayout()
+        cdist_row.setContentsMargins(16, 0, 0, 0)
+        c_lbl = QLabel('Буфер км:')
+        c_lbl.setFont(QFont('Arial', 12))
+        self.spin_cdist_km = QDoubleSpinBox()
+        self.spin_cdist_km.setRange(0.1, 5.0)
+        self.spin_cdist_km.setSingleStep(0.1)
+        self.spin_cdist_km.setDecimals(1)
+        self.spin_cdist_km.setValue(0.3)
+        self.spin_cdist_km.setEnabled(False)
+        cdist_row.addWidget(c_lbl)
+        cdist_row.addWidget(self.spin_cdist_km)
+        cdist_row.addStretch()
+        layout.addLayout(cdist_row)
+
+        self.chk_cdist.toggled.connect(self.spin_cdist_km.setEnabled)
+
         self._layout.addWidget(grp)
 
     def _build_branding(self):
@@ -269,6 +395,24 @@ class LeftPanel(QScrollArea):
     def set_bands_status(self, loaded_data: dict):
         for key, row in self.band_rows.items():
             row.set_found(key in loaded_data)
+
+        has_thermal = 'st_celsius' in loaded_data
+        has_cdist   = 'cdist_km'   in loaded_data
+
+        self.optional_rows['st_celsius'].set_status(has_thermal)
+        self.optional_rows['cdist_km'].set_status(has_cdist)
+
+        self.chk_thermal.setEnabled(has_thermal)
+        self.spin_thermal_temp.setEnabled(has_thermal and self.chk_thermal.isChecked())
+        if not has_thermal:
+            self.chk_thermal.setChecked(False)
+            self.chk_thermal.setToolTip('ST_B10 не загружен. Добавьте файл ST_B10.TIF в набор данных.')
+
+        self.chk_cdist.setEnabled(has_cdist)
+        self.spin_cdist_km.setEnabled(has_cdist and self.chk_cdist.isChecked())
+        if not has_cdist:
+            self.chk_cdist.setChecked(False)
+            self.chk_cdist.setToolTip('ST_CDIST не загружен. Добавьте файл ST_CDIST.TIF в набор данных.')
 
     def show_metadata(self, meta: dict):
         self.lbl_date.setText(f"{meta.get('date', '—')}  {meta.get('time', '')}")
@@ -351,4 +495,9 @@ class LeftPanel(QScrollArea):
             'merge_gap_px': self.spin_merge_gap.value(),
             'spatial_fill': self.chk_spatial_fill.isChecked(),
             'mask_shadows': self.chk_shadows.isChecked(),
+            'use_thermal_mask': self.chk_thermal.isChecked(),
+            'thermal_temp_c': self.spin_thermal_temp.value(),
+            'thermal_bright_threshold': 0.12,
+            'use_cdist_buffer': self.chk_cdist.isChecked(),
+            'cdist_buffer_km': self.spin_cdist_km.value(),
         })

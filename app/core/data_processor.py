@@ -7,6 +7,8 @@ class DataProcessor:
     def __init__(self):
         self.required_bands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7']
         self.required_qa = 'QA_PIXEL'
+        self.optional_thermal = 'ST_B10'
+        self.optional_cdist = 'ST_CDIST'
         self.data_cache = {}
         self.metadata = {}
 
@@ -15,6 +17,8 @@ class DataProcessor:
         try:
             band_files = {}
             qa_file = None
+            thermal_file = None
+            cdist_file = None
 
             for file_path in file_paths:
                 filename = Path(file_path).name.upper()
@@ -22,8 +26,12 @@ class DataProcessor:
                     if band in filename:
                         band_files[band] = file_path
                         break
-                if self.required_qa in filename:
+                if self.required_qa in filename and 'PIXEL' in filename:
                     qa_file = file_path
+                if self.optional_thermal in filename:
+                    thermal_file = file_path
+                if self.optional_cdist in filename:
+                    cdist_file = file_path
 
             missing_bands = set(self.required_bands) - set(band_files.keys())
             if missing_bands:
@@ -52,6 +60,33 @@ class DataProcessor:
 
             with rasterio.open(qa_file) as src:
                 loaded_data[self.required_qa] = src.read(1)
+
+            if thermal_file:
+                try:
+                    with rasterio.open(thermal_file) as src:
+                        raw = src.read(1).astype(np.float32)
+                        nodata = src.nodata
+                    # Landsat Collection 2 Level-2: T(K) = raw * 0.00341802 + 149.0
+                    # fill value = 0 (UINT16) → даёт -124°C, маскируем через NaN
+                    st = raw * 0.00341802 + 149.0 - 273.15
+                    fill_mask = (raw == 0) if nodata is None else (raw == nodata)
+                    st[fill_mask] = np.nan
+                    loaded_data['st_celsius'] = st
+                    print("ST_B10 загружен — температурная маска доступна")
+                except Exception as e:
+                    print(f"Не удалось загрузить ST_B10: {e}")
+
+            if cdist_file:
+                try:
+                    with rasterio.open(cdist_file) as src:
+                        raw = src.read(1).astype(np.float32)
+                    # ST_CDIST: scale = 0.01 km, nodata = -9999
+                    cdist_km = raw * 0.01
+                    cdist_km[raw < 0] = -1.0  # nodata → sentinel
+                    loaded_data['cdist_km'] = cdist_km
+                    print("ST_CDIST загружен — буферная маска доступна")
+                except Exception as e:
+                    print(f"Не удалось загрузить ST_CDIST: {e}")
 
             loaded_data = self._preprocess_data(loaded_data)
             loaded_data['meta'] = self.metadata

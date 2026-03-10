@@ -22,6 +22,11 @@ class AnalysisWorker(QThread):
                 merge_gap_px=self.params.get('merge_gap_px', 0),
                 spatial_fill=self.params.get('spatial_fill', False),
                 mask_shadows=self.params.get('mask_shadows', True),
+                use_thermal_mask=self.params.get('use_thermal_mask', False),
+                thermal_temp_c=self.params.get('thermal_temp_c', 5.0),
+                thermal_bright_threshold=self.params.get('thermal_bright_threshold', 0.12),
+                use_cdist_buffer=self.params.get('use_cdist_buffer', False),
+                cdist_buffer_km=self.params.get('cdist_buffer_km', 0.3),
             )
 
             self.progress.emit("Вычисление водных индексов...")
